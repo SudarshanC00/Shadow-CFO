@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+.env
+*.pdf
+temp_*.pdf
+
+# Node
+node_modules/
+.next/
+out/
+build/
+dist/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# OpenSearch/Docker (if any local state)
+infra/data/

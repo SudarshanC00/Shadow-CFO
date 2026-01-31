@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+langgraph
+langchain
+langchain-community
+langchain-openai
+langchain-anthropic
+opensearch-py
+unstructured[pdf]
+pdf2image
+psycopg2-binary
+python-multipart
+# Add any other dependencies as needed
