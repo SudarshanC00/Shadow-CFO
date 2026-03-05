@@ -1,17 +1,15 @@
 import operator
-from typing import Annotated, Sequence, TypedDict, Union, List
+import re
+from typing import Annotated, Sequence, TypedDict, List
 
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, FunctionMessage
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.utils.function_calling import convert_to_openai_function
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
-from langchain_anthropic import ChatAnthropic
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 from ingestion import get_retriever
 
-# --- State Application ---
+# --- State Definition ---
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
     documents: List[str]
@@ -23,312 +21,179 @@ class AgentState(TypedDict):
 # --- Tools ---
 @tool
 def calculator(expression: str) -> str:
-    """Calculates the result of a mathematical expression. Use python syntax."""
+    """Calculates results using python syntax. Required for financial calculations."""
     try:
-        # potentially unsafe, but standard for these demos. restrict in prod.
+        # In production, replace eval with a safer math parser
         return str(eval(expression))
     except Exception as e:
         return f"Error: {e}"
 
 tools = [calculator]
-# tool_executor = ToolExecutor(tools) # Removed legacy executor
+tool_node = ToolNode(tools)
 
 # --- Nodes ---
 
 def retrieve_node(state):
-    print("---RETRIEVE---")
+    print("\n--- [NODE] RETRIEVE & REHYDRATE ---")
     query = state['messages'][-1].content
     try:
         retriever = get_retriever()
         docs = retriever.invoke(query)
-        doc_contents = [d.page_content for d in docs]
-        
-        # DEBUG: Print what we're actually retrieving
-        print(f"\n📊 Retrieved {len(docs)} chunks for query: '{query[:50]}...'")
-        for i, doc in enumerate(docs):
-            category = doc.metadata.get('category', 'unknown')
+        rehydrated_context = []
+        for doc in docs:
             is_table = doc.metadata.get('is_table', False)
-            print(f"\nChunk {i+1}/{len(docs)}:")
-            print(f"  Category: {category} {'[TABLE]' if is_table else ''}")
-            print(f"  Preview: {doc.page_content[:150]}...")
-        
-        return {"documents": doc_contents, "steps": ["Retrieved relevant documents"]}
+            content = doc.metadata.get('raw_table_content', doc.page_content)
+            prefix = "[TABLE DATA]" if is_table else "[TEXT DATA]"
+            rehydrated_context.append(f"{prefix} Source: {doc.metadata.get('source')}\n{content}")
+        return {"documents": rehydrated_context, "steps": ["Retrieved context chunks"]}
     except Exception as e:
-        print(f"Retrieval Error: {e}")
-        return {"documents": [], "steps": ["No documents found (Please upload a PDF first)"]}
+        return {"documents": [], "steps": [f"Retrieval Error: {e}"]}
 
 def analyst_node(state):
-    print("---ANALYST---")
-    messages = state['messages']
-    docs = state.get('documents', [])
+    print("\n--- [NODE] ANALYST (OLLAMA LLAMA 3.1) ---")
+    context = "\n\n".join(state.get('documents', []))
     
-    # Enhanced Financial Auditor Protocol v2 - Technical Parser
-    context = "\n\n".join(docs)
-    system_message = f"""You are a Senior Financial Auditor and Technical Parser. Your objective is to extract high-fidelity data from SEC filings with ZERO TOLERANCE for placeholders (e.g., $X, $Y) or unverified inferences.
-
-**Instruction 1: Prioritize Tabular Coordinates**
-
-NOTE-FIRST SEARCH: When asked about segment data, EPS, or detailed expenses, search specifically for "Notes to Condensed Consolidated Financial Statements"
-- Note 10 for Segments
-- Note 3 for EPS
-- Note references are PRIMARY source
-
-GRID VERIFICATION: For every figure extracted, you MUST explicitly identify:
-- Row Header: (e.g., "Operating income/(loss)")
-- Column Header: (e.g., "December 27, 2025")
-- Their INTERSECTION value
-
-UNIT ENFORCEMENT: Always check the table header or Note header for units:
-- "In millions"
-- "Shares in thousands"
-- Apply units to final value
-
-**Instruction 2: Calculation & Grounding Rules**
-
-YEAR-OVER-YEAR (YoY) GROWTH:
-1. Retrieve values for BOTH current AND prior periods
-2. Calculate: ((Current - Prior) / Prior) × 100
-3. Show the actual numbers, not variables
-
-CALCULATION RULE - CRITICAL:
-- Do NOT look for pre-calculated percentages or margins
-- ALWAYS retrieve raw numbers (Net Sales, Cost of Sales, Operating Income)
-- Calculate margins yourself: ((Net Sales - Cost of Sales) / Net Sales) × 100
-- Example: For gross margin, get Net Sales AND Cost of Sales from table, then calculate
-- This ensures you use primary data from the filing, not summary text
-
-NO NARRATIVE INFERENCES:
-- Do NOT guess performance from narrative text (e.g., "iPhone sales grew")
-- Use "Operating Income" or "Net Sales" figures directly from reportable segment tables
-
-FALLBACK CLAUSE: If the specific table is NOT in your context, you MUST state:
-"CRITICAL: Table chunk for [Section] not found in current context. Please re-index the document focusing on the 'Notes' section."
-
-**Output Format Requirement:**
-
-1. DIRECT ANSWER: Provide the specific conclusion (e.g., "Greater China had the highest YoY growth at 12.3%")
-
-2. EVIDENCE TABLE: Create a simplified Markdown table showing exact numbers:
-   | Segment | Current Period | Prior Period | YoY Growth |
-   |---------|----------------|--------------|------------|
-   | Americas| $42,097M       | $42,997M     | -2.1%      |
-
-3. SOURCE: Cite the specific Note number and page (e.g., "Note 10, Page 8")
-
-Context from SEC Filing:
-{context}
-"""
+    # Using Llama 3.1 for Analysis
+    model = ChatOllama(model="llama3.1", temperature=0).bind_tools(tools)
     
-    # We use a model that supports function calling
-    # In a real scenario, we might use ChatAnthropic with Claude 3.5 Sonnet
-    # Here we default to OpenAI for broad compatibility in this snippet, 
-    # but the user requested Claude 3.5 Sonnet preference. 
-    # I will stick to ChatOpenAI for now as it's often more standard for tool calling in examples,
-    # Switched to Ollama for local inference
-    model = ChatOllama(model="llama3.1", temperature=0)
-    model = model.bind_tools(tools) # Updated to bind_tools
-    
-    try:
-        response = model.invoke([HumanMessage(content=system_message)] + messages)
-        return {"messages": [response], "current_answer": response.content if isinstance(response.content, str) else ""}
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        error_msg = f"Error in Analyst Node: {str(e)}"
-        return {"messages": [AIMessage(content=error_msg)], "current_answer": error_msg}
+    system_msg = f"""You are a Senior CFO Auditor. Your goal is 100% numerical accuracy.
 
-# Using prebuilt ToolNode instead of custom tool logic
-tool_node = ToolNode(tools)
+            **STEP 1: IDENTIFY THE TARGET TABLE**
+            Based on the user's query, determine which financial statement is needed:
+            - Revenue/Net Sales -> "Statements of Operations"
+            - Cash/Debt/Assets -> "Balance Sheets"
+            - Cash Inflow/Outflow -> "Statements of Cash Flows"
+            - Detailed Breakdown -> "Notes to Financial Statements"
+
+            **STEP 2: SCAN CONTEXT**
+            Check the provided context for headers matching these statements. 
+            - If the required table is present, extract the Row x Column intersection.
+            - If the table is NOT present, state: "The specific financial table for [Topic] was not found in the retrieved context. I can only see narrative text regarding [Summary of text]."
+
+            **STEP 3: NO HALLUCINATIONS**
+            - NEVER assume a number. 
+            - NEVER use placeholders like $X.
+            - If you see "In millions" in a header, ensure your final answer reflects that.
+
+            **CONTEXT:**
+        {context}
+        """
+    
+    response = model.invoke([HumanMessage(content=system_msg)] + state['messages'])
+    return {"messages": [response], "current_answer": response.content}
 
 def verifier_node(state):
-    print("---VERIFIER---")
+    print("\n--- [NODE] VERIFIER (OLLAMA LLAMA 3.1) ---")
     answer = state['current_answer']
-    docs = state.get('documents', [])
-    context = "\n\n".join(docs)
-    
-    # Get the original user query (it's the second to last message, before the AI answer)
-    # If the conversation is just starting, it might be the only message if we failed early, but typically:
-    # [Human, AI] -> Human is -2.
-    messages = state['messages']
-    user_query = messages[-2].content if len(messages) >= 2 else "Unknown Query"
-
-    verify_system = f"""Role: You are a Senior Financial Compliance Auditor. Your sole job is to verify if a generated "Analyst Answer" is strictly supported by the "Retrieved Context" provided.
-
-Input Data:
-
-User Query: {user_query}
-
-Retrieved Context: {context}
-
-Analyst Answer: {answer}
-
-Instructions:
-
-**Forensic Audit Checklist:**
-
-1. NUMERICAL MATCH: Does the number in the answer exist EXACTLY in the provided context?
-   - Search for the exact value (e.g., "$42,097 million")
-   - Verify it appears in a table, not inferred from narrative
-
-2. CONTEXTUAL ACCURACY: If Analyst claims "Growth was 44.5%", verify:
-   - Did they use the correct row? (e.g., "Operating Income" vs "Net Sales")
-   - Did they use the correct column? (e.g., "Dec 27, 2025" vs "Dec 28, 2024")
-   - Is the calculation shown correct?
-
-3. PLACEHOLDER DETECTION: Flag any response containing variables ($X, $Y, Z, A, B) as "Critical Failure"
-   - These indicate the Analyst used placeholders instead of actual numbers
-   - Automatic score: 0.0
-
-**Protocol Compliance Check:**
-1. DATA HIERARCHY: Verify the answer prioritizes numerical tables and notes over narrative text
-2. STRUCTURAL VERIFICATION: Check if specific values cite Row Label × Column Header × Unit of Measure
-3. CALCULATION ACCURACY: If calculations are shown, verify the math is correct
-4. ANTI-HALLUCINATION: Ensure NO values are inferred - all numbers must be explicitly in the context
-
-Verification Step: Compare every numerical value and factual claim in the Analyst Answer against the Retrieved Context.
-
-Check for Hallucinations: Identify any information in the Answer that is NOT explicitly stated in the Context, even if you know it is true in the real world (e.g., Apple's actual 2024 revenue if it's not in the provided snippet).
-
-Output Format:
-
-Groundedness Score: (0.0 to 1.0)
-
-Supported Claims: List claims found in the text.
-
-Violations: List specific claims or numbers that are NOT in the text.
-
-Correction Instruction: If the score is less than 1.0, write a specific instruction for the Analyst to re-generate the answer using ONLY the provided text or to state "Information not found."
-
-Strict Rule: If the Answer contains external system logs (like registry.ollama.ai/...) or general AI knowledge not present in the SEC filing, you must mark it as a Critical Failure.
-"""
+    context = "\n\n".join(state.get('documents', []))
     
     model = ChatOllama(model="llama3.1", temperature=0)
-    response = model.invoke([HumanMessage(content=verify_system)])
     
-    # Parse Score
-    import re
-    content = response.content
-    score_match = re.search(r"Groundedness Score:\s*(0\.\d+|1\.0|1)", content)
-    score = float(score_match.group(1)) if score_match else 0.0
+    verify_prompt = f"""Role: Forensic Auditor.
+    Compare the Analyst's Answer to the Context. 
     
-    current_retries = state.get("retry_count", 0)
+    Context: {context}
+    Answer: {answer}
+    
+    Check for:
+    1. Placeholders: Does the answer contain $X, $Y, or "Assume"? (If yes, score must be 0.0)
+    2. Numerical Match: Are the numbers exactly as they appear in the table?
+    
+    Output Format:
+    Groundedness Score: [0.0 to 1.0]
+    Violations: [List errors]
+    Correction Instruction: [Steps to fix]"""
+    
+    response = model.invoke([HumanMessage(content=verify_prompt)])
+    print(f"Verifier Feedback:\n{response.content}")
     
     return {
-        "messages": [AIMessage(content=content)], 
-        "steps": [f"Verifier Score: {score}"],
-        "auditor_feedback": content,
-        "retry_count": current_retries # Increment handled in edge or next node, but we pass current here. Logic best in edge.
+        "messages": [AIMessage(content=response.content)],
+        "auditor_feedback": response.content
     }
 
 def regenerator_node(state):
-    print("---REGENERATOR---")
-    messages = state['messages']
-    docs = state.get('documents', [])
-    feedback = state.get('auditor_feedback', "No feedback")
-    context = "\n\n".join(docs)
+    # Logic remains similar but using Llama 3.1
+    print(f"\n--- [NODE] REGENERATOR (RETRY {state.get('retry_count', 0) + 1}) ---")
+    feedback = state.get('auditor_feedback', "")
+    context = "\n\n".join(state.get('documents', []))
     
-    # Increment retry count
-    new_retries = state.get("retry_count", 0) + 1
+    model = ChatOllama(model="llama3.1", temperature=0).bind_tools(tools)
     
-    system_message = f"""You are the Shadow CFO Analyst performing a CORRECTION based on auditor feedback.
-
-Auditor Feedback:
-{feedback}
-
-Context from SEC Filing:
-{context}
-
-CORRECTION PROTOCOL:
-1. NOTE-FIRST SEARCH: If asked about segments/EPS/expenses, look for "Notes to Condensed Consolidated Financial Statements"
-2. GRID VERIFICATION: Identify Row Header × Column Header intersection
-3. UNIT ENFORCEMENT: Check table header for units (millions, thousands)
-4. NO PLACEHOLDERS: Use actual values, never $X or $Y
-5. FALLBACK: If table not found, state: "The numerical table for [Topic] was not found in the retrieved chunks."
-
-Re-write the answer using ONLY the provided text with proper table coordinates.
-If specific financial figures are not in the exact context, state: "Information not found in the provided document."
-"""
+    correction_prompt = f"""The previous response was REJECTED for hallucinations or inaccuracy.
     
-    model = ChatOllama(model="llama3.1", temperature=0)
-    response = model.invoke([HumanMessage(content=system_message)])
+    AUDITOR FEEDBACK: {feedback}
     
+    NEW DATA CONTEXT:
+    {context}
+    
+    RE-READ THE TABLES. Use actual values only. If a value is missing, state exactly which table you are looking for that is not there."""
+    
+    response = model.invoke([HumanMessage(content=correction_prompt)] + state['messages'])
     return {
-        "messages": [response], 
+        "messages": [response],
         "current_answer": response.content,
-        "retry_count": new_retries,
-        "steps": ["Regenerated answer based on auditor feedback"]
+        "retry_count": state.get('retry_count', 0) + 1
     }
 
-def max_retry_handler(state):
-    print("---MAX RETRIES REACHED---")
-    msg = "Maximum verification attempts reached. Information not verifiable in context."
-    return {
-        "messages": [AIMessage(content=msg)],
-        "current_answer": msg,
-        "steps": ["Aborted: Max retries reached"]
-    }
-
-# --- Graph ---
-workflow = StateGraph(AgentState)
-
-workflow.add_node("retrieve", retrieve_node)
-workflow.add_node("analyst", analyst_node)
-workflow.add_node("tool", tool_node)
-workflow.add_node("verifier", verifier_node)
-workflow.add_node("regenerator", regenerator_node)
-workflow.add_node("max_retry_handler", max_retry_handler)
-
-workflow.set_entry_point("retrieve")
-
-workflow.add_edge("retrieve", "analyst")
+# --- Router Logic ---
 
 def should_continue(state):
-    messages = state['messages']
-    last_message = messages[-1]
-    
-    if last_message.tool_calls:
+    last_msg = state['messages'][-1]
+    if hasattr(last_msg, 'tool_calls') and last_msg.tool_calls:
         return "tool"
     return "verifier"
 
 def check_groundedness(state):
     feedback = state.get('auditor_feedback', "")
+    print(f"DEBUG: Auditor says: {feedback[:100]}...")
     retries = state.get('retry_count', 0)
     
-    # Simple parse again or pass score in valid state. 
-    # For robustness, regex again
-    import re
-    score_match = re.search(r"Groundedness Score:\s*(0\.\d+|1\.0|1)", feedback)
-    score = float(score_match.group(1)) if score_match else 1.0 # Default to pass if parse fail to likely avoid loop
+    # Extraction of the score
+    score_match = re.search(r"Groundedness Score:\s*(\d?\.\d+|1\.0|1)", feedback)
+    score = float(score_match.group(1)) if score_match else 0.0
+    
+    print(f"--- [EDGE] Final Score: {score} | Retry: {retries} ---")
     
     if score < 1.0:
         if retries < 2:
+            print(">>> Rerouting to REGENERATOR for self-correction...")
             return "regenerator"
         else:
-            return "max_retry_handler"
-            
+            print(">>> Max retries reached. Exiting.")
+            return END
+    
+    print(">>> Accuracy Verified. Exiting.")
     return END
 
-workflow.add_conditional_edges(
-    "analyst",
-    should_continue,
-    {
-        "tool": "tool",
-        "verifier": "verifier"
-    }
-)
+# --- Graph Assembly ---
+workflow = StateGraph(AgentState)
 
-workflow.add_conditional_edges(
-    "verifier",
-    check_groundedness,
-    {
-        "regenerator": "regenerator",
-        "max_retry_handler": "max_retry_handler",
-        END: END
-    }
-)
+workflow.add_node("retrieve", retrieve_node)
+workflow.add_node("analyst", analyst_node)
+workflow.add_node("verifier", verifier_node)
+workflow.add_node("regenerator", regenerator_node)
+workflow.add_node("tool", tool_node)
 
+workflow.set_entry_point("retrieve")
+workflow.add_edge("retrieve", "analyst")
+
+# Transition from Analyst
+workflow.add_conditional_edges("analyst", should_continue, {
+    "tool": "tool",
+    "verifier": "verifier"
+})
+
+# Transition from Tool back to Analyst
+workflow.add_edge("tool", "analyst")
+
+# Transition from Verifier (THE LOOP)
+workflow.add_conditional_edges("verifier", check_groundedness, {
+    "regenerator": "regenerator",
+    END: END
+})
+
+# Transition from Regenerator back to Verifier to re-check
 workflow.add_edge("regenerator", "verifier")
-workflow.add_edge("max_retry_handler", END)
 
-workflow.add_edge("tool", "analyst") # Loop back to analyst after tool
 app_graph = workflow.compile()
