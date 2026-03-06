@@ -26,3 +26,5 @@ Thumbs.db
 
 # OpenSearch/Docker (if any local state)
 infra/data/
+backend/data/
+

@@ -1,0 +1,27 @@
+from opensearchpy import OpenSearch
+
+# Use your existing connection logic
+client = OpenSearch(hosts=["http://localhost:9200"], http_auth=None, use_ssl=False)
+
+def inspect_tables(index_name="shadow_cfo_docs"):
+    # Search for documents where we tagged 'is_table' as True
+    query = {
+        "size": 5,
+        "query": {
+            "term": {"metadata.is_table": True}
+        }
+    }
+    
+    response = client.search(index=index_name, body=query)
+    print(f"--- Found {len(response['hits']['hits'])} Table Chunks ---")
+    
+    for hit in response['hits']['hits']:
+        meta = hit['_source']['metadata']
+        content = hit['_source']['text'] # Adjust if your field is named 'page_content'
+        
+        print(f"\n[PAGE {meta.get('page_number')}] Category: {meta.get('category')}")
+        print(f"EMBEDDED SUMMARY: {content[:300]}...") 
+        print(f"RAW PREVIEW: {meta.get('raw_table_content', '')[:200]}...")
+        print("-" * 50)
+
+inspect_tables()

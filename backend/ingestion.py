@@ -1,23 +1,29 @@
-from pandas.core.internals.construction import dataclasses_to_dicts
 import os
-from typing import List
-from fastapi import UploadFile
+import json
 import shutil
+import asyncio
+from typing import List, Dict, Any
+from fastapi import UploadFile
+from concurrent.futures import ThreadPoolExecutor
+
 from langchain_community.document_loaders import UnstructuredPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_ollama import OllamaEmbeddings
+from langchain_ollama import OllamaEmbeddings, ChatOllama
 from langchain_community.vectorstores import OpenSearchVectorSearch
+from langchain_core.messages import HumanMessage
 from opensearchpy import OpenSearch, RequestsHttpConnection
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
 
 # Configuration
 OPENSEARCH_URL = os.getenv("OPENSEARCH_URL", "http://localhost:9200")
 OPENSEARCH_INDEX = "shadow_cfo_docs"
-EMBEDDING_MODEL = "text-embedding-3-small"
+EMBEDDING_MODEL = "nomic-embed-text"
 
-# Use a thread pool for the heavy CPU lifting of PDF parsing
-executor = ThreadPoolExecutor(max_workers=4)
+
+# Global executor for PDF parsing (CPU intensive)
+executor = ThreadPoolExecutor(max_workers=8)
+
+# Initialize the LLM (using Ollama for local processing)
+llm = ChatOllama(model="llama3.1", temperature=0)
 
 def get_opensearch_client():
     return OpenSearch(
@@ -28,138 +34,152 @@ def get_opensearch_client():
         connection_class=RequestsHttpConnection
     )
 
-from langchain_ollama import ChatOllama
-from langchain_core.messages import HumanMessage
-
-# Initialize the summarizer (Llama 3.1 is excellent for this)
-summarizer_llm = ChatOllama(model="llama3.1", temperature=0)
-
-async def get_global_context(docs: List) -> dict:
-    """Extracts Company Name and Period from the cover page (first few elements)."""
-    # Take first 10 elements to be safe
-    cover_text = "\n".join([d.page_content for d in docs[:10]])
-    
+async def generate_table_summary(table_content: str, table_title: str) -> str:
+    """Creates a highly detailed and searchable textualization of a financial table."""
     prompt = f"""
-    SYSTEM: You are a Financial Document Classifier.
-    TASK: Extract the following from this document text:
-    1. Exact Company Name
-    2. Primary Reporting Date/Period (e.g. "December 27, 2025" or "Q3 2025")
+    SYSTEM: You are an Expert Financial Data Analyst specializing in high-fidelity data extraction.
     
-    Return ONLY a JSON object like:
-    {{"company": "Company Name", "period": "The Date"}}
-    
-    TEXT:
-    {cover_text}
-    """
-    try:
-        response = await summarizer_llm.ainvoke([HumanMessage(content=prompt)])
-        # Simple cleanup in case LLM adds markdown blocks
-        clean_json = response.content.replace("```json", "").replace("```", "").strip()
-        return json.loads(clean_json)
-    except:
-        return {"company": "the company", "period": "the reporting period"}
-
-async def generate_table_summary(table_content: str, table_title: str, global_context: dict) -> str:
-    """Universal summarizer that anchors data to global context."""
-    prompt = f"""
-    SYSTEM: You are a Expert Financial Data Analyst. 
-    GLOBAL CONTEXT:
-    - Company: {global_context['company']}
-    - Main Period: {global_context['period']}
-    - Section: {table_title}
-
-    TASK: Convert the HTML table into factual sentences. 
+    TASK: Convert the provided table data (HTML or Text) into a detailed, prose-like textual representation.
     
     RULES:
-    1. SUBJECT: Every sentence must start with "{global_context['company']}".
-    2. DATES: If the table says 'Current Year' or 'Period End', use "{global_context['period']}".
-    3. MAPPING: Link every metric (row) to its value and the column date.
-    4. NO PAGE NUMBERS: Do not treat small integers (like 18, 19, 20) as years or dates; those are likely page numbers.
-    5. FORMAT: "[Company] [Metric] was [Value] for the period ended [Date]."
+    1. CONTEXT: Use the provided Section Title: "{table_title}" to anchor all metrics.
+    2. DETAIL: For every row in the table, create a full sentence explaining the metric, its value, and the specific date or period it refers to.
+    3. STRUCTURE: 
+       - Start with a summary sentence: "This table titled '{table_title}' provides financial data for..."
+       - Group data by period (year/quarter) if multiple columns exist.
+       - Use the format: "The metric [Metric Name] was [Value] for the period ended [Date]."
+    4. PRECISION:
+       - Match names EXACTLY as they appear in the row headers.
+       - Handle footnotes or parenthetical info if present (e.g., "including share-based compensation").
+       - Preserve the sign of the numbers (e.g., "(1,000)" should be "negative 1,000" or stated as a loss/decrease).
+    5. UNITS: Explicitly state "in millions" or "in thousands" if indicated in the table headers or metadata.
+    6. NO HALLUCINATION: If a cell is empty or "—", state it as "zero" or "not applicable". If you are unsure, do not invent data.
+    7. METRICS SIGNATURE: At the end, provide a "Searchable Metrics Key": [Comma-separated list of all metric row headers].
     
-    DATA:
+    TABLE CONTENT:
     {table_content}
     """
-    response = await summarizer_llm.ainvoke([HumanMessage(content=prompt)])
-    return response.content
-
-# Use a thread pool for the heavy CPU lifting of PDF parsing
-executor = ThreadPoolExecutor(max_workers=4)
+    try:
+        response = await llm.ainvoke([HumanMessage(content=prompt)])
+        return response.content
+    except Exception as e:
+        return f"Error textualizing table: {str(e)}"
 
 async def process_pdf(file: UploadFile):
+    client = get_opensearch_client()
+
+    # This deletes everything in the index so you start fresh
+    if client.indices.exists(index=OPENSEARCH_INDEX):
+        client.indices.delete(index=OPENSEARCH_INDEX)
+        print(f"Index {OPENSEARCH_INDEX} cleared.")
+        
     temp_path = f"temp_{file.filename}"
     with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     
     try:
         loop = asyncio.get_event_loop()
-        loader = UnstructuredPDFLoader(temp_path, mode="elements", strategy="hi_res", infer_table_structure=True)
+        # Using elements mode preserves table structure and metadata
+        loader = UnstructuredPDFLoader(temp_path, mode="elements", strategy="ocr_only", hi_res_model_name="yolox")
         docs = await loop.run_in_executor(executor, loader.load)
         
-        # 1. EXTRACT GLOBAL CONTEXT (Who and When)
-        global_meta = await get_global_context(docs)
-        print(f"Processing document for: {global_meta['company']} - {global_meta['period']}")
+        if not docs:
+            return {"status": "error", "message": "No content extracted from PDF"}
 
         processed_docs = []
+        table_tasks = []
+        table_indices = []
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200)
-        
-        # 2. TRACK SECTION TITLES
-        current_title = "Financial Report"
+        current_section = "General Financial Report"
 
-        for doc in docs:
+        for i, doc in enumerate(docs):
             category = doc.metadata.get('category')
+            page = doc.metadata.get('page_number', 1)
             
-            if category == 'Title':
-                current_title = doc.page_content
+            # Enrich basic metadata
+            doc.metadata.update({
+                "element_type": category,
+                "table_title": current_section if category == 'Table' else None
+            })
 
-            if category == 'Table':
-                html_content = doc.metadata.get('text_as_html')
-                content_to_summarize = html_content if html_content else doc.page_content
-                
-                # Use Global Context + Current Section Title
-                summary = await generate_table_summary(content_to_summarize, current_title, global_meta)
-                
-                doc.page_content = f"Financial Statement Data for {global_meta['company']}: {summary}"
-                doc.metadata["raw_table_content"] = html_content
-                doc.metadata["is_table"] = True
+
+            if category == 'Title':
+                current_section = doc.page_content
+                # Keep titles as context for grounding
+                doc.page_content = f"Section Header: {current_section}"
                 processed_docs.append(doc)
-            
-            elif category in ['NarrativeText', 'Title', 'UncategorizedText']:
-                # Add company name to narrative chunks to improve metadata retrieval
-                doc.page_content = f"Context: {global_meta['company']} {current_title}\n{doc.page_content}"
+
+            elif category == 'Table':
+                html_content = doc.metadata.get('text_as_html')
+                table_raw = html_content if html_content else doc.page_content
+                # Queue the task for parallel execution
+                table_tasks.append(generate_table_summary(table_raw, current_section))
+                table_indices.append(len(processed_docs)) 
                 
-                if len(doc.page_content) > 2000:
+                # Placeholder metadata
+                doc.metadata.update({"is_table": True, "table_title": current_section})
+                processed_docs.append(doc)
+
+            elif category in ['NarrativeText', 'UncategorizedText']:
+                if len(doc.page_content) < 50: continue
+                
+                doc.page_content = f"[Section: {current_section} | Page {page}]\n" + doc.page_content
+                if len(doc.page_content) > 1500:
                     processed_docs.extend(text_splitter.split_documents([doc]))
                 else:
                     processed_docs.append(doc)
-            else:
-                continue
 
-        if not processed_docs:
-            return {"status": "error", "message": "No content extracted"}
+        # SPEED FIX 3: Execute all LLM table summaries in parallel
+        if table_tasks:
+            print(f"Summarizing {len(table_tasks)} tables in parallel...")
+            summaries = await asyncio.gather(*table_tasks)
+            for idx, summary in zip(table_indices, summaries):
+                processed_docs[idx].page_content = summary
 
-        print(f"Indexing {len(processed_docs)} chunks to OpenSearch...")
+        # Persistence: Save processed content to a file for debugging/audit
+        storage_dir = "data/ingested"
+        os.makedirs(storage_dir, exist_ok=True)
+        storage_path = os.path.join(storage_dir, f"{file.filename}_processed.json")
+        
+        serializable_docs = [
+            {"page_content": doc.page_content, "metadata": doc.metadata}
+            for doc in processed_docs
+        ]
+        
+        with open(storage_path, "w") as f:
+            json.dump(serializable_docs, f, indent=2)
+        print(f"Saved processed content to {storage_path}")
+
+        # Indexing
+        print(f"Indexing {len(processed_docs)} chunks...")
         embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
         
-        docsearch = OpenSearchVectorSearch.from_documents(
-            processed_docs,
-            embeddings,
-            opensearch_url=OPENSEARCH_URL,
-            index_name=OPENSEARCH_INDEX,
-            engine="faiss",
-            space_type="l2",
-            bulk_size=1000
-        )
+        # Manual batching to avoid timeouts and provide progress updates
+        batch_size = 100
+        for i in range(0, len(processed_docs), batch_size):
+            batch = processed_docs[i : i + batch_size]
+            print(f"  Indexing batch {i//batch_size + 1}/{(len(processed_docs)-1)//batch_size + 1}...")
+            
+            if i == 0:
+                # First batch creates/overwrites the index
+                vector_store = OpenSearchVectorSearch.from_documents(
+                    batch,
+                    embeddings,
+                    opensearch_url=OPENSEARCH_URL,
+                    index_name=OPENSEARCH_INDEX,
+                    engine="faiss",
+                    space_type="l2"
+                )
+            else:
+                # Subsequent batches add to existing index
+                vector_store.add_documents(batch)
         
-        return {"status": "success", "chunks_processed": len(processed_docs)}
-        
-    except Exception as e:
-        print(f"Error: {e}")
-        raise e
+        print("Indexing complete.")
+        return {"status": "success", "chunks": len(processed_docs)}
+
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
-
 
 def get_retriever():
     embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
@@ -169,9 +189,7 @@ def get_retriever():
         embedding_function=embeddings
     )
     
-    # We increase 'k' because we want to catch both the summary and potentially 
-    # the narrative text surrounding it.
     return vector_store.as_retriever(
         search_type="mmr", 
-        search_kwargs={"k": 7, "fetch_k": 20} # Fetch 20, return the 7 most diverse
+        search_kwargs={"k": 7, "fetch_k": 20}
     )

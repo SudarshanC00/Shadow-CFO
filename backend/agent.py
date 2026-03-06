@@ -33,9 +33,40 @@ tool_node = ToolNode(tools)
 
 # --- Nodes ---
 
+def query_elaboration_node(state: AgentState):
+    print("\n--- [NODE] QUERY ELABORATION ---")
+    user_query = state['messages'][-1].content
+    
+    model = ChatOllama(model="llama3.1", temperature=0)
+    
+    elaboration_prompt = f"""
+    You are a Financial Search Specialist. Your task is to expand the user's query into a precise set of search terms for a 10-Q filing.
+    
+    USER QUERY: {user_query}
+    
+    GOAL:
+    1. Identify the likely Financial Statement needed (e.g., Statements of Operations, Balance Sheet).
+    2. Identify exact technical line items (e.g., 'Total net sales', 'Cost of sales', 'Accounts receivable').
+    3. Include relevant dates mentioned or implied (e.g., 'three months ended December 27, 2025').
+    
+    OUTPUT: 
+    Return ONLY a single string of optimized search terms. Do not provide conversational filler.
+    """
+    
+    response = model.invoke([HumanMessage(content=elaboration_prompt)])
+    print(f"Expanded Query: {response.content}")
+    
+    # Store the expanded query in a new key in state
+    return {"messages": [AIMessage(content=f"Expanded Query: {response.content}")], "steps": ["Elaborated user query"]}
+
 def retrieve_node(state):
     print("\n--- [NODE] RETRIEVE & REHYDRATE ---")
-    query = state['messages'][-1].content
+    # Use the elaboration if available, otherwise fallback to the last user message
+    if len(state['messages']) > 1 and "Expanded Query:" in state['messages'][-1].content:
+        query = state['messages'][-1].content.replace("Expanded Query: ", "")
+    else:
+        query = state['messages'][-1].content
+
     try:
         retriever = get_retriever()
         docs = retriever.invoke(query)
@@ -89,24 +120,30 @@ def verifier_node(state):
     
     model = ChatOllama(model="llama3.1", temperature=0)
     
-    verify_prompt = f"""Role: Forensic Auditor.
-    Compare the Analyst's Answer to the Context. 
+    verify_prompt = f"""
+    Role: Senior Forensic Auditor.
+    Task: Audit the Analyst's Answer against the provided Context for absolute numerical integrity.
     
-    Context: {context}
-    Answer: {answer}
+    CONTEXT DATA:
+    {context}
     
-    Check for:
-    1. Placeholders: Does the answer contain $X, $Y, or "Assume"? (If yes, score must be 0.0)
-    2. Numerical Match: Are the numbers exactly as they appear in the table?
+    PROPOSED ANSWER:
+    {answer}
     
-    Output Format:
+    AUDIT CHECKLIST:
+    1. METRIC ALIGNMENT: Does the name of the financial metric in the answer (e.g., 'Net Sales') match the EXACT row header in the context table? 
+       - WARNING: Do not confuse 'Net Sales' with 'Deferred Revenue' or 'Comprehensive Income'.
+    2. TEMPORAL ACCURACY: Does the value match the correct date column (e.g., Dec 27, 2025 vs Dec 28, 2024)?
+    3. SCALE CHECK: If the table says "In millions", does the answer correctly reflect that (e.g., $143,756 million = $143.76 billion)?
+    4. NO HALLUCINATION: Are there any numbers in the answer that do not exist in the context?
+    
+    REQUIRED OUTPUT FORMAT:
     Groundedness Score: [0.0 to 1.0]
-    Violations: [List errors]
-    Correction Instruction: [Steps to fix]"""
+    Violations: [List specific mismatches or "None"]
+    Correction Instruction: [If score < 1.0, provide the exact metric and value the model should use instead]
+    """
     
     response = model.invoke([HumanMessage(content=verify_prompt)])
-    print(f"Verifier Feedback:\n{response.content}")
-    
     return {
         "messages": [AIMessage(content=response.content)],
         "auditor_feedback": response.content
@@ -169,13 +206,15 @@ def check_groundedness(state):
 # --- Graph Assembly ---
 workflow = StateGraph(AgentState)
 
+workflow.add_node("elaborate", query_elaboration_node)
 workflow.add_node("retrieve", retrieve_node)
 workflow.add_node("analyst", analyst_node)
 workflow.add_node("verifier", verifier_node)
 workflow.add_node("regenerator", regenerator_node)
 workflow.add_node("tool", tool_node)
 
-workflow.set_entry_point("retrieve")
+workflow.set_entry_point("elaborate")
+workflow.add_edge("elaborate", "retrieve")
 workflow.add_edge("retrieve", "analyst")
 
 # Transition from Analyst
